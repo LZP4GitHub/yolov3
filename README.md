@@ -18,7 +18,7 @@
 
 # Introduction
 
-This directory contains PyTorch YOLOv3 software and an iOS App developed by Ultralytics LLC, and **is freely available for redistribution under the GPL-3.0 license**. For more information please visit https://www.ultralytics.com.
+This directory contains python software and an iOS App developed by Ultralytics LLC, and **is freely available for redistribution under the GPL-3.0 license**. For more information please visit https://www.ultralytics.com.
 
 # Description
 
@@ -29,7 +29,7 @@ The https://github.com/ultralytics/yolov3 repo contains inference and training c
 Python 3.7 or later with the following `pip3 install -U -r requirements.txt` packages:
 
 - `numpy`
-- `torch >= 1.1.0`
+- `torch >= 1.0.0`
 - `opencv-python`
 - `tqdm`
 
@@ -40,11 +40,6 @@ Python 3.7 or later with the following `pip3 install -U -r requirements.txt` pac
 * [Train Single Image](https://github.com/ultralytics/yolov3/wiki/Example:-Train-Single-Image)
 * [Train Single Class](https://github.com/ultralytics/yolov3/wiki/Example:-Train-Single-Class)
 * [Train Custom Data](https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data)
-
-# Jupyter Notebook
-
-A jupyter notebook with training, detection and testing examples is available at: 
-https://colab.research.google.com/drive/1G8T-VFxQkjDe4idzN8F-hbIBqkkkQnxw
 
 # Training
 
@@ -119,20 +114,6 @@ Run `detect.py` with `webcam=True` to show a live webcam feed.
 
 - Darknet `*.weights` format: https://pjreddie.com/media/files/yolov3.weights
 - PyTorch `*.pt` format: https://drive.google.com/drive/folders/1uxgUBemJVw9wZsdpboYbzUN4bcRhsuAI
-
-## Darknet Conversion
-
-```bash
-git clone https://github.com/ultralytics/yolov3 && cd yolov3
-
-# convert darknet cfg/weights to pytorch model
-python3  -c "from models import *; convert('cfg/yolov3-spp.cfg', 'weights/yolov3-spp.weights')"
-Success: converted 'weights/yolov3-spp.weights' to 'converted.pt'
-
-# convert cfg/pytorch model to darknet weights
-python3  -c "from models import *; convert('cfg/yolov3-spp.cfg', 'weights/yolov3-spp.pt')"
-Success: converted 'weights/yolov3-spp.pt' to 'converted.weights'
-```
 
 # mAP
 
@@ -211,6 +192,7 @@ Computing mAP: 100%|████████████████████
  Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = 0.331
  Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = 0.517
  Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = 0.618
+
 ```
 
 # Citation

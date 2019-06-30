@@ -15,7 +15,7 @@ def create_modules(module_defs):
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams['channels'])]
     module_list = nn.ModuleList()
-
+    yolo_layer_count = 0
     for i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
@@ -64,10 +64,11 @@ def create_modules(module_defs):
             anchors = [(anchors[i], anchors[i + 1]) for i in range(0, len(anchors), 2)]
             anchors = [anchors[i] for i in anchor_idxs]
             nc = int(module_def['classes'])  # number of classes
-            img_size = hyperparams['height']
+            img_size = int(hyperparams['height'])
             # Define detection layer
-            yolo_layer = YOLOLayer(anchors, nc, img_size, cfg=hyperparams['cfg'])
+            yolo_layer = YOLOLayer(anchors, nc, img_size, yolo_layer_count, cfg=hyperparams['cfg'])
             modules.add_module('yolo_%d' % i, yolo_layer)
+            yolo_layer_count += 1
 
         # Register module list and number of output filters
         module_list.append(modules)
@@ -99,59 +100,60 @@ class Upsample(nn.Module):
 
 
 class YOLOLayer(nn.Module):
-    def __init__(self, anchors, nc, img_size, cfg):
+    def __init__(self, anchors, nc, img_size, yolo_layer, cfg):
         super(YOLOLayer, self).__init__()
 
-        self.anchors = torch.Tensor(anchors)
+        self.anchors = torch.FloatTensor(anchors)
         self.na = len(anchors)  # number of anchors (3)
         self.nc = nc  # number of classes (80)
-        self.nx = 0  # initialize number of x gridpoints
-        self.ny = 0  # initialize number of y gridpoints
+        self.img_size = 0
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        create_grids(self, 32, 1, device=device)
 
         if ONNX_EXPORT:  # grids must be computed in __init__
             stride = [32, 16, 8][yolo_layer]  # stride of this layer
-            nx = int(img_size[1] / stride)  # number x grid points
-            ny = int(img_size[0] / stride)  # number y grid points
-            create_grids(self, max(img_size), (nx, ny))
+            if cfg.endswith('yolov3-tiny.cfg'):
+                stride *= 2
+
+            ng = int(img_size / stride)  # number grid points
+            create_grids(self, img_size, ng)
 
     def forward(self, p, img_size, var=None):
         if ONNX_EXPORT:
-            bs = 1  # batch size
+            bs, ng = 1, self.ng  # batch size, grid size
         else:
-            bs, ny, nx = p.shape[0], p.shape[-2], p.shape[-1]
-            if (self.nx, self.ny) != (nx, ny):
-                create_grids(self, img_size, (nx, ny), p.device)
+            bs, ng = p.shape[0], p.shape[-1]
+            if self.img_size != img_size:
+                create_grids(self, img_size, ng, p.device)
 
         # p.view(bs, 255, 13, 13) -- > (bs, 3, 13, 13, 85)  # (bs, anchors, grid, grid, classes + xywh)
-        p = p.view(bs, self.na, self.nc + 5, self.ny, self.nx).permute(0, 1, 3, 4, 2).contiguous()  # prediction
+        p = p.view(bs, self.na, self.nc + 5, ng, ng).permute(0, 1, 3, 4, 2).contiguous()  # prediction
 
         if self.training:
             return p
 
         elif ONNX_EXPORT:
-            # Constants CAN NOT BE BROADCAST, ensure correct shape!
-            ngu = self.ng.repeat((1, self.na * self.nx * self.ny, 1))
             grid_xy = self.grid_xy.repeat((1, self.na, 1, 1, 1)).view((1, -1, 2))
-            anchor_wh = self.anchor_wh.repeat((1, 1, self.nx, self.ny, 1)).view((1, -1, 2)) / ngu
+            anchor_wh = self.anchor_wh.repeat((1, 1, ng, ng, 1)).view((1, -1, 2)) / ng
 
             # p = p.view(-1, 5 + self.nc)
             # xy = torch.sigmoid(p[..., 0:2]) + grid_xy[0]  # x, y
             # wh = torch.exp(p[..., 2:4]) * anchor_wh[0]  # width, height
             # p_conf = torch.sigmoid(p[:, 4:5])  # Conf
             # p_cls = F.softmax(p[:, 5:85], 1) * p_conf  # SSD-like conf
-            # return torch.cat((xy / ngu[0], wh, p_conf, p_cls), 1).t()
+            # return torch.cat((xy / ng, wh, p_conf, p_cls), 1).t()
 
             p = p.view(1, -1, 5 + self.nc)
             xy = torch.sigmoid(p[..., 0:2]) + grid_xy  # x, y
             wh = torch.exp(p[..., 2:4]) * anchor_wh  # width, height
             p_conf = torch.sigmoid(p[..., 4:5])  # Conf
-            p_cls = p[..., 5:5 + self.nc]
+            p_cls = p[..., 5:85]
             # Broadcasting only supported on first dimension in CoreML. See onnx-coreml/_operators.py
             # p_cls = F.softmax(p_cls, 2) * p_conf  # SSD-like conf
             p_cls = torch.exp(p_cls).permute((2, 1, 0))
             p_cls = p_cls / p_cls.sum(0).unsqueeze(0) * p_conf.permute((2, 1, 0))  # F.softmax() equivalent
             p_cls = p_cls.permute(2, 1, 0)
-            return torch.cat((xy / ngu, wh, p_conf, p_cls), 2).squeeze().t()
+            return torch.cat((xy / ng, wh, p_conf, p_cls), 2).squeeze().t()
 
         else:  # inference
             io = p.clone()  # inference output
@@ -161,8 +163,6 @@ class YOLOLayer(nn.Module):
             io[..., 4:] = torch.sigmoid(io[..., 4:])  # p_conf, p_cls
             # io[..., 5:] = F.softmax(io[..., 5:], dim=4)  # p_cls
             io[..., :4] *= self.stride
-            if self.nc == 1:
-                io[..., 5] = 1  # single-class model https://github.com/ultralytics/yolov3/issues/235
 
             # reshape from [1, 3, 13, 13, 85] to [1, 507, 85]
             return io.view(bs, -1, 5 + self.nc), p
@@ -171,21 +171,17 @@ class YOLOLayer(nn.Module):
 class Darknet(nn.Module):
     """YOLOv3 object detection model"""
 
-    def __init__(self, cfg, img_size=(416, 416)):
+    def __init__(self, cfg_path, img_size=416):
         super(Darknet, self).__init__()
 
-        self.module_defs = parse_model_cfg(cfg)
-        self.module_defs[0]['cfg'] = cfg
+        self.module_defs = parse_model_cfg(cfg_path)
+        self.module_defs[0]['cfg'] = cfg_path
         self.module_defs[0]['height'] = img_size
         self.hyperparams, self.module_list = create_modules(self.module_defs)
         self.yolo_layers = get_yolo_layers(self)
 
-        # Darknet Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
-        self.version = np.array([0, 2, 5], dtype=np.int32)  # (int32) version info: major, minor, revision
-        self.seen = np.array([0], dtype=np.int64)  # (int64) number of images seen during training
-
     def forward(self, x, var=None):
-        img_size = max(x.shape[-2:])
+        img_size = x.shape[-1]
         layer_outputs = []
         output = []
 
@@ -211,26 +207,10 @@ class Darknet(nn.Module):
             return output
         elif ONNX_EXPORT:
             output = torch.cat(output, 1)  # cat 3 layers 85 x (507, 2028, 8112) to 85 x 10647
-            nc = self.module_list[self.yolo_layers[0]][0].nc  # number of classes
-            return output[5:5 + nc].t(), output[:4].t()  # ONNX scores, boxes
+            return output[5:85].t(), output[:4].t()  # ONNX scores, boxes
         else:
             io, p = list(zip(*output))  # inference output, training output
             return torch.cat(io, 1), p
-
-    def fuse(self):
-        # Fuse Conv2d + BatchNorm2d layers throughout model
-        fused_list = nn.ModuleList()
-        for a in list(self.children())[0]:
-            for i, b in enumerate(a):
-                if isinstance(b, nn.modules.batchnorm.BatchNorm2d):
-                    # fuse this bn layer with the previous conv2d layer
-                    conv = a[i - 1]
-                    fused = torch_utils.fuse_conv_and_bn(conv, b)
-                    a = nn.Sequential(fused, *list(a.children())[i + 1:])
-                    break
-            fused_list.append(a)
-        self.module_list = fused_list
-        # model_info(self)  # yolov3-spp reduced from 225 to 152 layers
 
 
 def get_yolo_layers(model):
@@ -238,21 +218,19 @@ def get_yolo_layers(model):
     return [i for i, x in enumerate(a) if x]  # [82, 94, 106] for yolov3
 
 
-def create_grids(self, img_size=416, ng=(13, 13), device='cpu'):
-    nx, ny = ng  # x and y grid size
+def create_grids(self, img_size, ng, device='cpu'):
     self.img_size = img_size
-    self.stride = img_size / max(ng)
+    self.stride = img_size / ng
 
     # build xy offsets
-    yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
-    self.grid_xy = torch.stack((xv, yv), 2).to(device).float().view((1, 1, ny, nx, 2))
+    grid_x = torch.arange(ng).repeat((ng, 1)).view((1, 1, ng, ng)).float()
+    grid_y = grid_x.permute(0, 1, 3, 2)
+    self.grid_xy = torch.stack((grid_x, grid_y), 4).to(device)
 
     # build wh gains
     self.anchor_vec = self.anchors.to(device) / self.stride
     self.anchor_wh = self.anchor_vec.view(1, self.na, 1, 1, 2).to(device)
-    self.ng = torch.Tensor(ng).to(device)
-    self.nx = nx
-    self.ny = ny
+    self.ng = torch.FloatTensor([ng]).to(device)
 
 
 def load_darknet_weights(self, weights, cutoff=-1):
@@ -273,13 +251,16 @@ def load_darknet_weights(self, weights, cutoff=-1):
     elif weights_file == 'yolov3-tiny.conv.15':
         cutoff = 15
 
-    # Read weights file
-    with open(weights, 'rb') as f:
-        # Read Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
-        self.version = np.fromfile(f, dtype=np.int32, count=3)  # (int32) version info: major, minor, revision
-        self.seen = np.fromfile(f, dtype=np.int64, count=1)  # (int64) number of images seen during training
+    # Open the weights file
+    fp = open(weights, 'rb')
+    header = np.fromfile(fp, dtype=np.int32, count=5)  # First five are header values
 
-        weights = np.fromfile(f, dtype=np.float32)  # The rest are weights
+    # Needed to write header when saving weights
+    self.header_info = header
+
+    self.seen = header[3]  # number of images seen during training
+    weights = np.fromfile(fp, dtype=np.float32)  # The rest are weights
+    fp.close()
 
     ptr = 0
     for i, (module_def, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
@@ -320,50 +301,26 @@ def load_darknet_weights(self, weights, cutoff=-1):
     return cutoff
 
 
-def save_weights(self, path='model.weights', cutoff=-1):
-    # Converts a PyTorch model to Darket format (*.pt to *.weights)
-    # Note: Does not work if model.fuse() is applied
-    with open(path, 'wb') as f:
-        # Write Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
-        self.version.tofile(f)  # (int32) version info: major, minor, revision
-        self.seen.tofile(f)  # (int64) number of images seen during training
+def save_weights(self, path, cutoff=-1):
+    fp = open(path, 'wb')
+    self.header_info[3] = self.seen  # number of images seen during training
+    self.header_info.tofile(fp)
 
-        # Iterate through layers
-        for i, (module_def, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
-            if module_def['type'] == 'convolutional':
-                conv_layer = module[0]
-                # If batch norm, load bn first
-                if module_def['batch_normalize']:
-                    bn_layer = module[1]
-                    bn_layer.bias.data.cpu().numpy().tofile(f)
-                    bn_layer.weight.data.cpu().numpy().tofile(f)
-                    bn_layer.running_mean.data.cpu().numpy().tofile(f)
-                    bn_layer.running_var.data.cpu().numpy().tofile(f)
-                # Load conv bias
-                else:
-                    conv_layer.bias.data.cpu().numpy().tofile(f)
-                # Load conv weights
-                conv_layer.weight.data.cpu().numpy().tofile(f)
+    # Iterate through layers
+    for i, (module_def, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
+        if module_def['type'] == 'convolutional':
+            conv_layer = module[0]
+            # If batch norm, load bn first
+            if module_def['batch_normalize']:
+                bn_layer = module[1]
+                bn_layer.bias.data.cpu().numpy().tofile(fp)
+                bn_layer.weight.data.cpu().numpy().tofile(fp)
+                bn_layer.running_mean.data.cpu().numpy().tofile(fp)
+                bn_layer.running_var.data.cpu().numpy().tofile(fp)
+            # Load conv bias
+            else:
+                conv_layer.bias.data.cpu().numpy().tofile(fp)
+            # Load conv weights
+            conv_layer.weight.data.cpu().numpy().tofile(fp)
 
-
-def convert(cfg='cfg/yolov3-spp.cfg', weights='weights/yolov3-spp.weights'):
-    # Converts between PyTorch and Darknet format per extension (i.e. *.weights convert to *.pt and vice versa)
-    # from models import *; convert('cfg/yolov3-spp.cfg', 'weights/yolov3-spp.weights')
-
-    # Initialize model
-    model = Darknet(cfg)
-
-    # Load weights and save
-    if weights.endswith('.pt'):  # if PyTorch format
-        model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
-        save_weights(model, path='converted.weights', cutoff=-1)
-        print("Success: converted '%s' to 'converted.weights'" % weights)
-
-    elif weights.endswith('.weights'):  # darknet format
-        _ = load_darknet_weights(model, weights)
-        chkpt = {'epoch': -1, 'best_loss': None, 'model': model.state_dict(), 'optimizer': None}
-        torch.save(chkpt, 'converted.pt')
-        print("Success: converted '%s' to 'converted.pt'" % weights)
-
-    else:
-        print('Error: extension not supported.')
+    fp.close()
